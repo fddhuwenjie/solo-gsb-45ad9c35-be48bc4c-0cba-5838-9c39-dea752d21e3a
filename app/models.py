@@ -337,3 +337,61 @@ class SessionStateResponse(BaseModel):
     version: dict[str, int]
     conflicts: list[Conflict]
     tombstones: list[str]
+
+
+class HistoryReadRequest(BaseModel):
+    """Body of POST /sessions/{id}/history: cursor plus 1..100 subscriptions.
+
+    ``after_revision`` is the revision the caller has already seen; the
+    response returns the routed events of up to 20 committed revisions
+    after it, each relative to the immediately previous revision (the
+    same routing rules as ``POST /route-changes``).  Revision 0 is the
+    initial document.
+    """
+
+    after_revision: int = Field(
+        ge=0,
+        validation_alias=AliasChoices("after_revision", "revision"),
+        description=(
+            "last revision already read; events are returned for later "
+            "revisions (alias: revision)"
+        ),
+    )
+    subscriptions: list[Subscription] = Field(
+        min_length=1,
+        max_length=100,
+        description="subscriptions following the POST /route-changes rules",
+    )
+
+
+class RevisionChanges(BaseModel):
+    """Routed events of one committed revision relative to the previous one."""
+
+    revision: int
+    routes: list[SubscriberChanges]
+    unrouted: list[ChangeEvent]
+
+
+class HistoryReadResponse(BaseModel):
+    """Incremental read page: at most 20 revisions after the cursor.
+
+    ``last_revision`` is the cursor to send with the next request; it
+    equals the request cursor when no new revision existed (or the page
+    is empty), and ``has_more`` indicates whether further revisions
+    remain beyond this page.
+    """
+
+    session_id: str
+    revisions: list[RevisionChanges]
+    last_revision: int = Field(
+        description=(
+            "new cursor: the last revision included in this response, or "
+            "the request cursor when nothing was new"
+        )
+    )
+    latest_revision: int = Field(
+        description="the session's current latest revision at read time"
+    )
+    has_more: bool = Field(
+        description="whether more committed revisions remain after this page"
+    )

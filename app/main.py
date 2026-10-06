@@ -9,6 +9,8 @@ from .models import (
     ApplyRequest,
     BatchRequest,
     BatchResponse,
+    HistoryReadRequest,
+    HistoryReadResponse,
     MergeRequest,
     MergeResult,
     OperationId,
@@ -25,11 +27,16 @@ from .models import (
 from .query import QueryValidationError, run_queries
 from .resolve import ResolveValidationError, resolve_documents
 from .routing import RoutingValidationError, route_changes
-from .sessions import RevisionConflictError, SessionNotFoundError, SessionStore
+from .sessions import (
+    HistoryCursorError,
+    RevisionConflictError,
+    SessionNotFoundError,
+    SessionStore,
+)
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -39,9 +46,11 @@ app = FastAPI(
         "JSONPath querying (POST /query); cross-document reference "
         "resolution with overlays (POST /resolve); and durable "
         "batched-submission sessions (POST /sessions, "
-        "POST /sessions/{session_id}/batches, GET /sessions/{session_id}) "
-        "that accumulate operation batches into one cumulative log "
-        "re-merged from the initial document on every commit."
+        "POST /sessions/{session_id}/batches, GET /sessions/{session_id}, "
+        "POST /sessions/{session_id}/history) that accumulate operation "
+        "batches into one cumulative log re-merged from the initial "
+        "document on every commit, with paged incremental reads of the "
+        "routed change events of each committed revision."
     ),
 )
 
@@ -180,3 +189,32 @@ def submit_batch(session_id: str, req: BatchRequest, request: Request) -> dict:
         "accepted": outcome.accepted,
         "duplicates": outcome.duplicates,
     }
+
+
+@app.post(
+    "/sessions/{session_id}/history",
+    response_model=HistoryReadResponse,
+)
+def read_session_history(
+    session_id: str, req: HistoryReadRequest, request: Request
+) -> dict:
+    """Read routed change events of committed revisions after a cursor.
+
+    Each returned revision carries the ``/route-changes`` events of its
+    document relative to the previous revision, ordered by revision
+    (revision 0 is the initial document).  At most 20 revisions are
+    returned per request; ``last_revision`` is the cursor for the next
+    request and is echoed unchanged when nothing new was committed.
+    """
+    try:
+        return _session_store(request).read_history(
+            session_id, req.after_revision, req.subscriptions
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except HistoryCursorError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RoutingValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
