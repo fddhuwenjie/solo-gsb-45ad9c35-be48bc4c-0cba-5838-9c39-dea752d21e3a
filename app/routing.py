@@ -200,10 +200,14 @@ def _dedupe(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
-def route_changes(
-    before: Any, after: Any, subscriptions: list[Subscription]
-) -> dict[str, Any]:
-    """Diff two snapshots and distribute the events to subscribers."""
+def compile_subscriptions(
+    subscriptions: list[Subscription],
+) -> list[tuple[str, tuple, tuple]]:
+    """Validate and compile subscribers: unique ids, valid patterns.
+
+    Returns ``(subscriber_id, compiled_includes, compiled_excludes)``
+    tuples in request order; the caller sorts by id when serializing.
+    """
     seen_ids: set[str] = set()
     compiled: list[tuple[str, tuple, tuple]] = []
     for sub in subscriptions:
@@ -215,9 +219,14 @@ def route_changes(
         includes = tuple(compile_pattern(p) for p in sub.include)
         excludes = tuple(compile_pattern(p) for p in sub.exclude)
         compiled.append((sub.subscriber_id, includes, excludes))
+    return compiled
 
-    events = diff_events(before, after)
 
+def route_events(
+    events: list[dict[str, Any]],
+    compiled: list[tuple[str, tuple, tuple]],
+) -> dict[str, Any]:
+    """Distribute already-computed diff events among compiled subscribers."""
     routed: dict[str, list[dict[str, Any]]] = {}
     unrouted: list[dict[str, Any]] = []
     for event in events:
@@ -251,3 +260,12 @@ def route_changes(
             for event in sorted(_dedupe(unrouted), key=_event_key)
         ],
     }
+
+
+def route_changes(
+    before: Any, after: Any, subscriptions: list[Subscription]
+) -> dict[str, Any]:
+    """Diff two snapshots and distribute the events to subscribers."""
+    compiled = compile_subscriptions(subscriptions)
+    events = diff_events(before, after)
+    return route_events(events, compiled)

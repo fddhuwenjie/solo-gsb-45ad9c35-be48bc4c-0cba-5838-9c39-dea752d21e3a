@@ -337,3 +337,60 @@ class SessionStateResponse(BaseModel):
     version: dict[str, int]
     conflicts: list[Conflict]
     tombstones: list[str]
+
+
+# ---------------------------------------------------------------------------
+# POST /sessions/{id}/changes -- incremental, subscription-routed revision reads
+# ---------------------------------------------------------------------------
+
+
+class RevisionChangesRequest(BaseModel):
+    """Body of POST /sessions/{id}/changes: a cursor plus 1..100 subscriptions.
+
+    ``after_revision`` is the last revision the caller has already read;
+    revisions strictly after it (up to 20 per response) are returned in
+    revision order, each carrying the route-changes events of its document
+    relative to the previous revision, routed with exactly the same rules
+    as ``POST /route-changes``.
+    """
+
+    after_revision: int = Field(
+        ge=0,
+        description="last revision already read; revision 0 is the initial document",
+    )
+    subscriptions: list[Subscription] = Field(min_length=1, max_length=100)
+
+
+class RevisionChanges(BaseModel):
+    """One committed revision and its routed changes versus revision - 1.
+
+    A revision stays present even when its document is identical to the
+    previous revision's; its routes/unrouted are simply empty then.
+    """
+
+    revision: int
+    routes: list[SubscriberChanges]
+    unrouted: list[ChangeEvent]
+
+
+class RevisionChangesResponse(BaseModel):
+    """Incremental revision window; ``next_cursor`` continues the paging."""
+
+    session_id: str
+    current_revision: int = Field(
+        description="the session's latest committed revision at read time"
+    )
+    after_revision: int = Field(description="the cursor echoed from the request")
+    next_cursor: int = Field(
+        description=(
+            "revision of the last entry returned (== current_revision when no "
+            "more revisions remain); equals after_revision when there were no "
+            "new revisions"
+        )
+    )
+    has_more: bool = Field(
+        description="true when more committed revisions remain past next_cursor"
+    )
+    changes: list[RevisionChanges] = Field(
+        description="up to 20 revisions after the cursor, in revision order"
+    )

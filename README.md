@@ -21,8 +21,11 @@
   版本向量并返回修订号 0；`POST /sessions/{id}/batches` 凭期望修订号提交
   非空操作批次，校验、重算与修订提交原子完成（多进程共享存储目录时同样
   成立）；`GET /sessions/{id}` 读取最新修订号、文档、版本向量、冲突与
-  墓碑。每次提交都从初始文档重算累计日志（不把上次结果当作新基线），
-  会话持久化到磁盘卷，重启后仍可读取。
+  墓碑；`POST /sessions/{id}/changes` 传入已读修订号和 1～100 条订阅，
+  按修订顺序增量补读之后最多 20 次已提交修订各自的路由事件，返回下次
+  读取游标。每次提交都从初始文档重算累计日志（不把上次结果当作新基线），
+  每次提交的文档快照（历史边界）与修订号一同持久化，会话持久化到磁盘卷，
+  重启后仍可读取、仍可接续分页。
 
 ## 快速启动
 
@@ -586,6 +589,10 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   `{"session_id", "revision", "accepted", "duplicates"}`。
 - `GET /sessions/{session_id}`：读取最新修订号、文档、版本向量、冲突与
   墓碑。
+- `POST /sessions/{session_id}/changes`：传入 `after_revision`（已读修订号）
+  与 1～100 条沿用 `/route-changes` 规则的订阅，按修订顺序返回该游标之后
+  最多 20 次已提交修订，每条修订是该修订文档相对**前一修订**文档的路由
+  事件；响应带 `next_cursor` 供下次补读。
 
 语义要点：
 
@@ -593,8 +600,28 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   确定性裁决、墓碑、数组插入排序）从初始文档处理**累计日志**，上次结果
   不会被当作新基线——晚到的并发写仍参与原有裁决和冲突统计，跨批的因果
   引用（`version` 中的他人序号）可以指向此前任何批次已存的操作。
+- **历史边界不可变**：每次新增修订时，提交时刻的合并文档作为该修订的
+  历史边界与修订号、日志在**同一个原子写**中落盘。修订 `r` 的事件就是
+  边界 `r-1 → r` 的快照 diff（与 `POST /route-changes` 的规则完全一致）。
+  晚到的并发编辑会改变**当前**合并结果，但永远不会改写先前修订已返回的
+  事件。修订 0 的边界是创建会话时的初始文档。
+- **增量补读与空事件**：`POST /sessions/{id}/changes` 每次最多返回 20 条
+  修订；`next_cursor` 为本次最后一条修订（恰好追上当前修订时即等于当前
+  修订号），`has_more` 提示后面是否还有修订；没有新修订时 `changes` 为空、
+  `next_cursor` 原样等于 `after_revision`。即使某次提交后的文档与前一修订
+  **完全相同**（例如把字段设成已有值），该修订仍保留在历史中并以空
+  `routes`/`unrouted` 返回——游标必须能逐修订推进。
+- **游标范围**：`after_revision` 不得早于会话的历史起点，也不得大于当前
+  修订号，否则返回 `422`；会话不存在返回 `404`；非法模式、重复
+  `subscriber_id`、订阅数不在 1～100 之间同样返回 `422`。
+- **升级前已有会话**：旧版本写出的会话文件没有历史边界。首次访问
+  （任意读取，或第一次成功提交/整批重传）时，以当时可见的当前修订作为
+  历史起点并原子持久化；早于该起点的游标返回 `422`。此后提交的新批次
+  正常追加边界。过期（`409`）或非法（`422`）批次不会写入起点，也不会
+  新增历史。
 - **重传幂等**：操作 ID `(actor, seq)` 相同且内容一致的重传不重复保存
-  （计入 `duplicates`）；整批没有新操作时不递增修订号，仍返回成功。
+  （计入 `duplicates`）；整批没有新操作时不递增修订号、不新增历史边界，
+  仍返回成功。
 - **失败不落盘**：同 ID 内容不同、日志非法（序号断档、因果引用缺失、
   版本向量回退等）或执行失败（如对非数组 `insert`）返回 `422`；
   `expected_revision` 过期返回 `409`；会话不存在返回 `404`。这些失败
@@ -604,26 +631,30 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   的多个服务进程之间同样成立（见下文「共享存储目录下的并发调用」）。
 - **持久化**：每个会话以 JSON 文件存于 `SESSION_STORE_DIR`（默认
   `./.sessions`；docker compose 中设为 `/data/sessions`，挂载命名卷
-  `session-data`），`docker compose restart` 或 `down` + `up` 之后
-  会话仍可读取、可继续提交。
+  `session-data`），历史边界随会话同文件保存，`docker compose restart`
+  或 `down` + `up` 之后会话仍可读取、可继续提交，增量分页也能从上次
+  游标接续。
 
 ### 共享存储目录下的并发调用
 
 多个服务进程（或多个容器挂载同一卷、`docker compose up --scale api=N`
 多副本）可以共用同一个 `SESSION_STORE_DIR`。此时提交路径在进程内锁之外
 再按会话加一把 `flock` 文件锁（存储目录下的 `.{session_id}.lock` 文件），
-并在持锁期间**重新从磁盘读取**会话：修订号检查、累计日志重算与原子落盘
-（临时文件 + `os.replace`）作为一个跨进程临界区整体生效。因此：
+并在持锁期间**重新从磁盘读取**会话：修订号检查、累计日志重算、历史边界
+追加与原子落盘（临时文件 + `os.replace`）作为一个跨进程临界区整体生效。
+因此：
 
 - 两个进程都已读到修订号 0、随后各自以 `expected_revision=0` 提交不同
   批次时，只有一笔成功，另一笔在锁内看到修订号已推进而返回 `409`；
-  不会出现后写覆盖先写的修订丢失。
-- 会话不做进程内缓存，`GET /sessions/{id}` 总是反映磁盘上最新已提交的
-  状态，任一进程都能立即读到成功批次与最新修订号。
-- 重传幂等、非法批次 `422`、过期修订号 `409`、会话不存在 `404` 的语义
-  与单进程完全一致，失败同样不落盘。
+  不会出现后写覆盖先写的修订丢失，成功批次的历史边界也必然与修订号
+  一起对所有进程可见。
+- 会话不做进程内缓存，`GET /sessions/{id}` 与增量补读总是反映磁盘上最新
+  已提交的状态，任一进程都能立即读到成功批次、最新修订号并接续分页。
+- 重传幂等、非法批次 `422`、过期修订号 `409`、会话不存在 `404`、游标
+  越界 `422` 的语义与单进程完全一致，失败同样不落盘。
 - 锁文件随会话保留（不删除，避免 unlink/reopen 竞态），数量与会话数
-  相同；读取路径不加锁，靠原子替换保证不会读到写了一半的文件。
+  相同；读取路径仅在需要为升级前会话建立历史起点时持锁落盘，其余时候
+  靠原子替换保证不会读到写了一半的文件。
 
 注意：文件锁依赖本地 POSIX 文件系统（命名卷、本地磁盘均可）；把存储目录
 放到 NFS 等网络文件系统上前请自行评估锁语义。用 `--scale` 水平扩容时请
@@ -728,25 +759,192 @@ curl -s -X POST localhost:8000/sessions/$SID/batches \
 # => {"detail":"operation alice:1 appears twice with different payloads"}
 ```
 
+### POST /sessions/{id}/changes —— 按修订号增量补读路由事件
+
+调用方分批提交后，用已读修订号作为游标补读每次实际生效的文档变更。
+请求体包含 `after_revision` 和 1～100 条订阅，订阅的 include/exclude
+模式、通配段、`unrouted` 等规则与 `POST /route-changes` 完全相同。
+按修订顺序返回游标之后**最多 20 次**已提交修订，每条修订的事件是该修订
+文档相对于**前一修订**文档的 diff；`next_cursor` 是本次最后一条修订号，
+下次请求原样带回即可继续翻页。
+
+接着上例（当前修订号为 2），从修订 0 补读：
+
+```bash
+curl -s -X POST localhost:8000/sessions/$SID/changes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "after_revision": 0,
+    "subscriptions": [
+      {"subscriber_id": "title-svc", "include": ["/title"]},
+      {"subscriber_id": "items-svc", "include": ["/items"]}
+    ]
+  }'
+```
+
+```json
+{
+  "session_id": "...",
+  "current_revision": 2,
+  "after_revision": 0,
+  "next_cursor": 2,
+  "has_more": false,
+  "changes": [
+    {
+      "revision": 1,
+      "routes": [
+        {"subscriber_id": "items-svc", "events": [
+          {"type": "replace", "path": "/items", "old": ["x"], "new": ["A", "x"]}]},
+        {"subscriber_id": "title-svc", "events": [
+          {"type": "replace", "path": "/title", "old": "draft", "new": "alice-title"}]}
+      ],
+      "unrouted": []
+    },
+    {
+      "revision": 2,
+      "routes": [
+        {"subscriber_id": "items-svc", "events": []},
+        {"subscriber_id": "title-svc", "events": [
+          {"type": "replace", "path": "/title", "old": "alice-title", "new": "bob-title"}]}
+      ],
+      "unrouted": []
+    }
+  ]
+}
+```
+
+要点：
+
+- **逐修订 diff**：修订 2 的 `old` 是修订 1 的文档（`alice-title`），
+  不是初始文档。修订 1 的事件在修订 2 提交后也不会变化——尽管当前合并
+  结果里 `/title` 已被晚到的 `bob:1` 改成 `bob-title`，历史边界不可变。
+- **没有新修订时游标原样返回**：用 `next_cursor` 轮询，`changes` 为空、
+  `next_cursor` 等于传入的 `after_revision`：
+
+```bash
+curl -s -X POST localhost:8000/sessions/$SID/changes \
+  -H 'Content-Type: application/json' \
+  -d '{"after_revision": 2,
+       "subscriptions": [{"subscriber_id": "title-svc", "include": ["/title"]}]}'
+# => {"session_id":"...","current_revision":2,"after_revision":2,
+#     "next_cursor":2,"has_more":false,"changes":[]}
+```
+
+- **文档未变化也保留修订**：一次提交若把字段设为它已有的值，修订号
+  照常递增、历史照常保留，该修订以空事件返回（游标仍能逐修订推进）。
+- **错误码**：游标早于历史起点或超过当前修订返回 `422`；会话不存在
+  返回 `404`；非法模式、重复 `subscriber_id`、订阅数不在 1～100 返回
+  `422`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/changes \
+  -H 'Content-Type: application/json' \
+  -d '{"after_revision": 9, "subscriptions":[{"subscriber_id":"s","include":["/**"]}]}'
+# => 422  ({"detail":"after_revision 9 is outside the known history ..."})
+```
+
+#### 分页补读循环（超过 20 次修订）
+
+每次响应最多 20 条修订；`has_more` 为 `true` 时把 `next_cursor` 作为
+下次的 `after_revision` 继续请求，直到它追上 `current_revision`：
+
+```bash
+# 连续提交 25 个批次（每个批次推进一次修订号）
+SID=$(curl -s -X POST localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"document": {"n": 0}, "version": {}}' \
+  | python3 -c "import sys, json; print(json.load(sys.stdin)['session_id'])")
+for i in $(seq 1 25); do
+  curl -s -o /dev/null -X POST localhost:8000/sessions/$SID/batches \
+    -H 'Content-Type: application/json' \
+    -d "{\"expected_revision\": $((i-1)),
+         \"operations\": [{\"actor\":\"alice\",\"seq\":$i,\"version\":{\"alice\":$i},\"path\":\"/n\",\"action\":\"set\",\"value\":$i}]}"
+done
+
+# 用 next_cursor 循环翻页，直到 has_more=false（SID 从环境变量传入）
+SID="$SID" python3 - <<'PY'
+import json, os, urllib.request
+
+sid = os.environ["SID"]
+cursor = 0
+while True:
+    req = urllib.request.Request(
+        f"http://localhost:8000/sessions/{sid}/changes",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps({
+            "after_revision": cursor,
+            "subscriptions": [{"subscriber_id": "n-svc", "include": ["/n"]}],
+        }).encode(),
+    )
+    page = json.load(urllib.request.urlopen(req))
+    for change in page["changes"]:
+        event = change["routes"][0]["events"][0]
+        print(f"revision {change['revision']}: {event['old']} -> {event['new']}")
+    print(f"-- next_cursor={page['next_cursor']} "
+          f"current={page['current_revision']} has_more={page['has_more']}")
+    if not page["has_more"]:
+        break
+    cursor = page["next_cursor"]
+PY
+```
+
+输出（第一页 20 条，第二页 5 条；每次 diff 的 `old` 是紧邻的前一修订）：
+
+```text
+revision 1: 0 -> 1
+...
+revision 20: 19 -> 20
+-- next_cursor=20 current=25 has_more=True
+revision 21: 20 -> 21
+...
+revision 25: 24 -> 25
+-- next_cursor=25 current=25 has_more=False
+```
+
+重启服务（`docker compose restart`）后用最后保存的 `next_cursor` 继续
+请求即可，历史边界随会话持久化，无需从头补读。
+
+#### 升级前已有会话的历史起点
+
+旧版本创建、本次升级后首次被访问的会话，以首次访问（`GET`、`changes`
+或成功提交/整批重传）时可见的当前修订作为历史起点；早于起点的游标
+返回 `422`，从起点开始的后续修订正常分页：
+
+```bash
+# 假设升级前该会话已有修订 0..3，首次 changes 访问：
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/changes \
+  -H 'Content-Type: application/json' \
+  -d '{"after_revision": 2, "subscriptions":[{"subscriber_id":"s","include":["/**"]}]}'
+# => 422  (2 早于首次访问时建立的历史起点 3)
+curl -s -X POST localhost:8000/sessions/$SID/changes \
+  -H 'Content-Type: application/json' \
+  -d '{"after_revision": 3, "subscriptions":[{"subscriber_id":"s","include":["/**"]}]}'
+# => {..."next_cursor":3,"changes":[]}  -- 起点之后提交的新批次才会出现
+```
+
 ## 项目结构
 
 ```
 app/
   main.py      # FastAPI 路由：POST /merge、POST /apply、POST /route-changes、POST /query、POST /resolve、
-               # POST /sessions、POST /sessions/{id}/batches、GET /sessions/{id}、GET /healthz
+               # POST /sessions、POST /sessions/{id}/batches、GET /sessions/{id}、
+               # POST /sessions/{id}/changes、GET /healthz
   models.py    # Pydantic 请求/响应模型
   engine.py    # 合并引擎：向量时钟、校验、因果排序、冲突检测、应用器
   routing.py   # 快照递归 diff、JSON Pointer 通配模式匹配、订阅分发
   query.py     # 受限 JSONPath 解析与求值（只读、单查询 10000 节点预算）
   resolve.py   # 跨文档 $ref 物化：覆盖层合并、引用链循环检测、叶子来源映射
-  sessions.py  # 分批会话：累计日志、跨进程原子提交（文件锁内校验+重算+修订）、JSON 文件持久化
+  sessions.py  # 分批会话：累计日志、不可变历史边界、跨进程原子提交（文件锁内校验+重算+边界+修订）、
+               # 增量修订补读（每次最多 20 条、游标分页）、旧会话历史起点迁移、JSON 文件持久化
 tests/
-  test_api.py            # 22 个 merge/apply 端到端测试
-  test_exclude.py        # 29 个 merge/apply 排除裁剪端到端测试
-  test_route_changes.py  # 30 个 route-changes 端到端测试
-  test_query.py          # 73 个 /query 端到端测试
-  test_resolve.py        # 37 个 /resolve 端到端测试
-  test_sessions.py       # 22 个分批会话端到端测试
+  test_api.py              # 22 个 merge/apply 端到端测试
+  test_exclude.py          # 29 个 merge/apply 排除裁剪端到端测试
+  test_route_changes.py    # 30 个 route-changes 端到端测试
+  test_query.py            # 73 个 /query 端到端测试
+  test_resolve.py          # 37 个 /resolve 端到端测试
+  test_sessions.py         # 22 个分批会话端到端测试
+  test_session_changes.py  # 27 个增量修订补读端到端测试（分页、不可变边界、旧会话迁移、持久化）
 conftest.py
 Dockerfile
 docker-compose.yml

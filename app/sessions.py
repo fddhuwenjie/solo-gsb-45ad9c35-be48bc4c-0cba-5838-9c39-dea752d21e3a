@@ -8,6 +8,29 @@ baseline -- so late-arriving concurrent writes still take part in the
 original arbitration and conflict accounting, and a batch may causally
 reference operations stored by earlier batches.
 
+Every commit that contributes new operations also appends an immutable
+**history boundary**: the merged document at the new revision.  Boundary
+``h`` is the document of revision ``h``, so the events of revision ``r``
+are the snapshot diff from boundary ``r-1`` to boundary ``r`` -- exactly
+what ``POST /route-changes`` would compute between the two documents.
+Boundaries are persisted in the same atomic write as the revision (inside
+the same cross-process locked section), so an incremental reader can page
+through committed revisions after a restart.  Retransmissions, stale
+``expected_revision`` submissions and invalid batches add no history.
+
+Late-arriving concurrent edits change the *current* merge result but can
+never rewrite a previously committed boundary: a boundary stores the
+document snapshot that was current at commit time, not a pointer into a
+later recomputation.
+
+Sessions written by older versions of the service have no history
+boundaries.  On the first access (any read, or the first successful
+commit) of such a legacy record the boundary history is seeded with one
+entry: the currently visible merged document at the session's current
+revision.  That revision becomes the session's history origin: cursors
+before it, or past the current revision, are rejected (422 at the HTTP
+layer).
+
 Batch commits are atomic: validation, recomputation and the revision bump
 happen inside a critical section guarded by an in-process lock *and* a
 per-session ``flock`` file (``.{session_id}.lock`` next to the session
@@ -38,14 +61,23 @@ import re
 import threading
 import uuid
 from collections.abc import Iterator
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .engine import merge_logs, validate_and_dedupe
-from .models import Operation
+from .models import Operation, Subscription
+from .routing import (
+    compile_subscriptions,
+    diff_events,
+    route_events,
+)
 
 _SESSION_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
+
+#: Maximum number of committed revisions returned by one incremental read.
+CHANGES_PAGE_SIZE = 20
 
 
 class SessionNotFoundError(KeyError):
@@ -56,6 +88,25 @@ class RevisionConflictError(RuntimeError):
     """Raised when the expected revision does not match the current one."""
 
 
+class CursorOutOfRangeError(ValueError):
+    """Raised when an incremental-read cursor is outside the known history."""
+
+
+@dataclass
+class _Boundary:
+    """One immutable history point: the merged document at ``revision``."""
+
+    revision: int
+    document: Any
+
+    def to_json(self) -> dict[str, Any]:
+        return {"revision": self.revision, "document": self.document}
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "_Boundary":
+        return cls(revision=int(data["revision"]), document=data["document"])
+
+
 @dataclass
 class SessionRecord:
     """The durable state of one session.
@@ -63,6 +114,11 @@ class SessionRecord:
     ``document``/``version`` are the pinned initial state; ``log`` is the
     cumulative, de-duplicated operation log accepted so far; ``revision``
     counts the batches that contributed at least one new operation.
+    ``history`` is the revision-ordered list of document snapshots
+    (boundaries), starting at the history origin -- revision 0 for new
+    sessions, the then-current revision for records created before this
+    feature existed.  ``history is None`` marks a not-yet-migrated legacy
+    record.
     """
 
     session_id: str
@@ -70,6 +126,7 @@ class SessionRecord:
     document: Any
     version: dict[str, int]
     log: list[Operation] = field(default_factory=list)
+    history: list[_Boundary] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -78,16 +135,30 @@ class SessionRecord:
             "document": self.document,
             "version": self.version,
             "log": [op.model_dump(mode="json") for op in self.log],
+            # Legacy records (history is None) keep omitting the field;
+            # the first successful access seeds and persists it.
+            **(
+                {"history": [b.to_json() for b in self.history]}
+                if self.history is not None
+                else {}
+            ),
         }
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "SessionRecord":
+        raw_history = data.get("history", None)
+        history = (
+            [_Boundary.from_json(item) for item in raw_history]
+            if raw_history is not None
+            else None
+        )
         return cls(
             session_id=data["session_id"],
             revision=int(data["revision"]),
             document=data["document"],
             version={k: int(v) for k, v in data["version"].items()},
             log=[Operation.model_validate(o) for o in data["log"]],
+            history=history,
         )
 
 
@@ -176,6 +247,27 @@ class SessionStore:
 
     # -- session lifecycle ----------------------------------------------
 
+    @staticmethod
+    def _merged_document(rec: SessionRecord) -> Any:
+        """The current merged document, recomputed from the initial document."""
+        return merge_logs(rec.document, rec.version, [rec.log])["document"]
+
+    def _seed_history(self, rec: SessionRecord) -> bool:
+        """Seed boundary history for a legacy record; return whether seeded.
+
+        The origin is the merged document visible at the record's current
+        revision.  The caller must hold the session's cross-process lock
+        and persist after this returns ``True``.
+        """
+        if rec.history is not None:
+            return False
+        if rec.revision == 0:
+            origin = deepcopy(rec.document)
+        else:
+            origin = self._merged_document(rec)
+        rec.history = [_Boundary(rec.revision, origin)]
+        return True
+
     def create(self, document: Any, version: dict[str, int]) -> SessionRecord:
         """Create a session pinned to ``document``/``version`` at revision 0."""
         initial_version = dict(version or {})
@@ -185,6 +277,9 @@ class SessionStore:
             revision=0,
             document=document,
             version=initial_version,
+            # Revision 0 is the history origin: its boundary is the pinned
+            # initial document and no event can ever point before it.
+            history=[_Boundary(0, deepcopy(document))],
         )
         with self._lock:
             self._persist(rec)
@@ -201,17 +296,39 @@ class SessionStore:
         """Recompute the merged state from the initial document and full log."""
         with self._lock:
             rec = self._load(session_id)
-            if rec is None:
+        if rec is None:
+            raise SessionNotFoundError(session_id)
+        # Reads stay lock-free (the atomic temp-file-plus-rename persist
+        # guarantees a coherent file); only a legacy record's first touch
+        # enters the cross-process section to seed and persist its origin.
+        if rec.history is None:
+            rec = self._migrate_legacy(session_id)
+        result = merge_logs(rec.document, rec.version, [rec.log])
+        return {
+            "session_id": rec.session_id,
+            "revision": rec.revision,
+            "document": result["document"],
+            "version": result["version"],
+            "conflicts": result["conflicts"],
+            "tombstones": result["tombstones"],
+        }
+
+    def _migrate_legacy(self, session_id: str) -> SessionRecord:
+        """Re-load and seed a pre-upgrade record's history origin under lock.
+
+        The record is re-read from disk inside the cross-process section so
+        concurrent first touches converge on one persisted origin.
+        """
+        with self._locked(session_id):
+            rec = self._load(session_id)
+            if rec is None:  # pragma: no cover - existence checked by caller
                 raise SessionNotFoundError(session_id)
-            result = merge_logs(rec.document, rec.version, [rec.log])
-            return {
-                "session_id": rec.session_id,
-                "revision": rec.revision,
-                "document": result["document"],
-                "version": result["version"],
-                "conflicts": result["conflicts"],
-                "tombstones": result["tombstones"],
-            }
+            self._seed_and_persist(rec)
+            return rec
+
+    def _seed_and_persist(self, rec: SessionRecord) -> None:
+        if self._seed_history(rec):
+            self._persist(rec)
 
     def submit_batch(
         self, session_id: str, expected_revision: int, operations: list[Operation]
@@ -222,14 +339,16 @@ class SessionStore:
         the ordinary rules: retransmitted operations (same id, same
         content) are not stored twice, the same id with different content
         is rejected, and causal references may point at stored operations.
-        A batch that contributes no new operation leaves the revision
-        untouched; any validation or execution failure leaves the session
-        untouched as well (no partial commits).
+        A batch that contributes no new operation leaves the revision --
+        and the history -- untouched; any validation or execution failure
+        leaves the session untouched as well (no partial commits, no new
+        boundary).
 
         The record is re-read from disk and the revision check,
-        recomputation and persist all run inside the session's
-        cross-process lock, so two processes sharing the store directory
-        cannot both commit on top of the same revision.
+        recomputation, history append and persist all run inside the
+        session's cross-process lock, so two processes sharing the store
+        directory cannot both commit on top of the same revision, and the
+        new revision's boundary is durable together with the revision.
         """
         if not _SESSION_ID_RE.fullmatch(session_id):
             raise SessionNotFoundError(session_id)
@@ -249,12 +368,107 @@ class SessionStore:
             stored = {(op.actor, op.seq) for op in rec.log}
             new_ops = [op for op in unique_ops if (op.actor, op.seq) not in stored]
             if not new_ops:
+                # Exact retransmission at the current revision: a success
+                # is still an access, so a legacy record gets its origin
+                # seeded here as well -- without adding any history entry.
+                self._seed_and_persist(rec)
                 return BatchOutcome(session_id, rec.revision, 0, duplicates)
+            # Legacy records carry no boundary for the pre-batch state;
+            # seed the origin (the document visible at the current
+            # revision) before diffing against the new document.
+            self._seed_history(rec)
             # Recompute from the initial document over the cumulative log;
             # a validation or execution failure raises before anything is
-            # written, so the session keeps its previous revision and log.
-            merge_logs(rec.document, rec.version, [unique_ops])
+            # written, so the session keeps its previous revision and log
+            # and the legacy origin is also not persisted.
+            new_document = merge_logs(rec.document, rec.version, [unique_ops])[
+                "document"
+            ]
             rec.log = unique_ops
             rec.revision += 1
+            # Immutable boundary: later batches never rewrite this entry,
+            # even when late concurrent edits change the current merge.
+            rec.history.append(_Boundary(rec.revision, new_document))
             self._persist(rec)
             return BatchOutcome(session_id, rec.revision, len(new_ops), duplicates)
+
+    # -- incremental revision reads -------------------------------------
+
+    def read_changes(
+        self,
+        session_id: str,
+        after_revision: int,
+        subscriptions: list[Subscription],
+    ) -> dict[str, Any]:
+        """Return at most ``CHANGES_PAGE_SIZE`` routed revisions after a cursor.
+
+        Each returned revision carries the ``/route-changes`` events of its
+        boundary document relative to the previous revision's boundary;
+        revisions whose document is unchanged still appear with empty
+        routes/unrouted.  Boundaries are read from durable history, so a
+        revision's events can never change after the commit -- including
+        when later concurrent edits change the current merged document.
+
+        Cursors before the session's history origin or past the current
+        revision raise ``CursorOutOfRangeError`` (HTTP 422).  With no new
+        revisions the cursor is echoed unchanged.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        with self._lock:
+            rec = self._load(session_id)
+        if rec is None:
+            raise SessionNotFoundError(session_id)
+        if rec.history is None:
+            rec = self._migrate_legacy(session_id)
+        # Validate patterns after the session is known to exist (so a
+        # missing session stays a 404) and after any legacy migration; an
+        # invalid request therefore never seeds or persists anything.
+        compiled = compile_subscriptions(subscriptions)
+        history = rec.history
+        assert history is not None  # just seeded above
+        origin = history[0].revision
+        if after_revision < origin or after_revision > rec.revision:
+            raise CursorOutOfRangeError(
+                f"after_revision {after_revision} is outside the known "
+                f"history of session {session_id!r}: revisions "
+                f"{origin}..{rec.revision}"
+            )
+        return self._build_changes(rec, history, after_revision, compiled)
+
+    def _build_changes(
+        self,
+        rec: SessionRecord,
+        history: list[_Boundary],
+        after_revision: int,
+        compiled: list[tuple[str, tuple, tuple]],
+    ) -> dict[str, Any]:
+        # Boundaries are revision-contiguous from the origin, so the
+        # previous document of the first selected revision is at index-1.
+        start = after_revision - history[0].revision
+        selected = history[start + 1 : start + 1 + CHANGES_PAGE_SIZE]
+        changes: list[dict[str, Any]] = []
+        prev_doc = history[start].document
+        for boundary in selected:
+            events = diff_events(prev_doc, boundary.document)
+            routed = route_events(events, compiled)
+            changes.append(
+                {
+                    "revision": boundary.revision,
+                    "routes": routed["routes"],
+                    "unrouted": routed["unrouted"],
+                }
+            )
+            prev_doc = boundary.document
+        if selected:
+            next_cursor = selected[-1].revision
+        else:
+            next_cursor = after_revision
+        return {
+            "session_id": rec.session_id,
+            "current_revision": rec.revision,
+            "after_revision": after_revision,
+            "next_cursor": next_cursor,
+            "has_more": next_cursor < rec.revision,
+            "changes": changes,
+        }

@@ -16,6 +16,8 @@ from .models import (
     QueryResponse,
     ResolveRequest,
     ResolveResult,
+    RevisionChangesRequest,
+    RevisionChangesResponse,
     RouteChangesRequest,
     RouteChangesResult,
     SessionCreateRequest,
@@ -25,11 +27,16 @@ from .models import (
 from .query import QueryValidationError, run_queries
 from .resolve import ResolveValidationError, resolve_documents
 from .routing import RoutingValidationError, route_changes
-from .sessions import RevisionConflictError, SessionNotFoundError, SessionStore
+from .sessions import (
+    CursorOutOfRangeError,
+    RevisionConflictError,
+    SessionNotFoundError,
+    SessionStore,
+)
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -39,9 +46,11 @@ app = FastAPI(
         "JSONPath querying (POST /query); cross-document reference "
         "resolution with overlays (POST /resolve); and durable "
         "batched-submission sessions (POST /sessions, "
-        "POST /sessions/{session_id}/batches, GET /sessions/{session_id}) "
-        "that accumulate operation batches into one cumulative log "
-        "re-merged from the initial document on every commit."
+        "POST /sessions/{session_id}/batches, GET /sessions/{session_id}, "
+        "POST /sessions/{session_id}/changes) that accumulate operation "
+        "batches into one cumulative log re-merged from the initial "
+        "document on every commit, and page the per-revision routed "
+        "change events after a caller-supplied revision cursor."
     ),
 )
 
@@ -180,3 +189,25 @@ def submit_batch(session_id: str, req: BatchRequest, request: Request) -> dict:
         "accepted": outcome.accepted,
         "duplicates": outcome.duplicates,
     }
+
+
+@app.post(
+    "/sessions/{session_id}/changes",
+    response_model=RevisionChangesResponse,
+)
+def read_revision_changes(
+    session_id: str, req: RevisionChangesRequest, request: Request
+) -> dict:
+    """Page committed revisions' routed change events after a revision cursor."""
+    try:
+        return _session_store(request).read_changes(
+            session_id, req.after_revision, req.subscriptions
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except CursorOutOfRangeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RoutingValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
